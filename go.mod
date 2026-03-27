@@ -1,4 +1,4 @@
-module riemann-tui
+module github.com/Griaustinis-Media/riemann-tui
 
 go 1.21
 

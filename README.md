@@ -9,21 +9,15 @@ A terminal dashboard for [Riemann](https://riemann.io/) that streams events in r
 ## Install
 
 ```bash
-git clone https://github.com/Griaustinis-Media/riemann-tui
-cd riemann-tui
-go build -o riemann-tui .
+go install github.com/Griaustinis-Media/riemann-tui@latest
 ```
+
+The binary is placed in `$(go env GOPATH)/bin`. Make sure that directory is on your `$PATH`.
 
 ## Usage
 
 ```bash
-./riemann-tui --addr localhost:5556 --path /index --query 'true'
-```
-
-Or run directly without building:
-
-```bash
-go run . --addr localhost:5556 --path /index --query 'true'
+riemann-tui --addr localhost:5556 --path /index --query 'true'
 ```
 
 ### Flags
@@ -85,13 +79,13 @@ The dashboard sends WebSocket keepalive pings every 30 seconds to prevent idle c
 For TLS termination at the proxy:
 
 ```bash
-./riemann-tui --addr riemann.example.com:443 --tls
+riemann-tui --addr riemann.example.com:443 --tls
 ```
 
 For self-signed certificates:
 
 ```bash
-./riemann-tui --addr riemann.example.com:443 --insecure
+riemann-tui --addr riemann.example.com:443 --insecure
 ```
 
 ## Debugging
@@ -99,6 +93,6 @@ For self-signed certificates:
 If no events appear, run with `--debug` to inspect the raw WebSocket frames:
 
 ```bash
-./riemann-tui --addr localhost:5556 --path /index --query 'true' --debug /tmp/riemann.log
+riemann-tui --addr localhost:5556 --path /index --query 'true' --debug /tmp/riemann.log
 tail -f /tmp/riemann.log
 ```
