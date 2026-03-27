@@ -26,25 +26,52 @@ const (
 	pongWait     = 10 * time.Second
 )
 
+// AttrMap decodes Riemann attributes from either a JSON object
+// {"k":"v"} or the cheshire array format [{"key":"k","value":"v"}].
+type AttrMap map[string]string
+
+func (a *AttrMap) UnmarshalJSON(b []byte) error {
+	// Try array of {key, value} first (cheshire / standard Riemann wire format)
+	var arr []struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if json.Unmarshal(b, &arr) == nil {
+		m := make(map[string]string, len(arr))
+		for _, kv := range arr {
+			m[kv.Key] = kv.Value
+		}
+		*a = m
+		return nil
+	}
+	// Fall back to plain object
+	var m map[string]string
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	*a = m
+	return nil
+}
+
 // RiemannEvent is a Riemann monitoring event decoded from JSON.
 // Riemann WebSocket transport converts protobuf to JSON via cheshire.
 // The metric field may appear as a unified "metric" or as typed variants.
 type RiemannEvent struct {
-	Host        string            `json:"host"`
-	Service     string            `json:"service"`
-	State       string            `json:"state"`
-	Description string            `json:"description"`
-	Tags       []string    `json:"tags"`
-	TTL        float64     `json:"ttl"`
-	Time       interface{} `json:"time"` // string ISO-8601 or int64 unix epoch
-	TimeMicros int64       `json:"time_micros"`
+	Host        string      `json:"host"`
+	Service     string      `json:"service"`
+	State       string      `json:"state"`
+	Description string      `json:"description"`
+	Tags        []string    `json:"tags"`
+	TTL         float64     `json:"ttl"`
+	Time        interface{} `json:"time"` // string ISO-8601 or int64 unix epoch
+	TimeMicros  int64       `json:"time_micros"`
 	// Metric variants: Riemann protobuf has metric_sint64, metric_d, metric_f
 	// Some transports unify them under "metric"
 	Metric       interface{} `json:"metric"`
 	MetricSint64 *int64      `json:"metric_sint64"`
 	MetricD      *float64    `json:"metric_d"`
 	MetricF      *float32    `json:"metric_f"`
-	Attributes   map[string]string `json:"attributes"`
+	Attributes   AttrMap     `json:"attributes"`
 }
 
 func (e RiemannEvent) metricStr() string {
@@ -86,8 +113,53 @@ func (e RiemannEvent) timeStr() string {
 	return time.Now().Format("15:04:05")
 }
 
+// eventTime returns the event timestamp, falling back to zero.
+func (e RiemannEvent) eventTime() time.Time {
+	if e.TimeMicros != 0 {
+		return time.UnixMicro(e.TimeMicros)
+	}
+	switch v := e.Time.(type) {
+	case string:
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			return t
+		}
+	case float64:
+		return time.Unix(int64(v), 0)
+	}
+	return time.Time{}
+}
+
+// expiresAt returns the time after which this event should be evicted from the
+// summary, or zero if the event has no TTL.
+func (e RiemannEvent) expiresAt() time.Time {
+	if e.TTL <= 0 {
+		return time.Time{}
+	}
+	t := e.eventTime()
+	if t.IsZero() {
+		return time.Time{}
+	}
+	return t.Add(time.Duration(e.TTL * float64(time.Second)))
+}
+
 func (e RiemannEvent) tagsStr() string {
 	return strings.Join(e.Tags, " ")
+}
+
+func (e RiemannEvent) attrsStr() string {
+	if len(e.Attributes) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(e.Attributes))
+	for k := range e.Attributes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+e.Attributes[k])
+	}
+	return strings.Join(parts, " ")
 }
 
 func stateColor(state string) tcell.Color {
@@ -269,7 +341,7 @@ func (d *Dashboard) setSvcHeaders() {
 }
 
 func (d *Dashboard) setEvtHeaders() {
-	for i, h := range []string{"TIME", "HOST", "SERVICE", "STATE", "METRIC", "TAGS"} {
+	for i, h := range []string{"TIME", "HOST", "SERVICE", "STATE", "METRIC", "TAGS", "ATTRS"} {
 		d.evtTbl.SetCell(0, i,
 			tview.NewTableCell(" "+h+" ").
 				SetTextColor(tcell.ColorYellow).
@@ -441,6 +513,13 @@ func (d *Dashboard) refreshUI() {
 		d.rateStart = now
 	}
 
+	// Evict summary entries whose TTL has elapsed.
+	for k, e := range d.summary {
+		if exp := e.expiresAt(); !exp.IsZero() && now.After(exp) {
+			delete(d.summary, k)
+		}
+	}
+
 	stream := make([]RiemannEvent, len(d.stream))
 	copy(stream, d.stream)
 	summary := make(map[string]RiemannEvent, len(d.summary))
@@ -549,12 +628,17 @@ func (d *Dashboard) refreshUI() {
 			if len(tags) > 22 {
 				tags = tags[:21] + "…"
 			}
+			attrs := e.attrsStr()
+			if len(attrs) > 40 {
+				attrs = attrs[:39] + "…"
+			}
 			d.evtTbl.SetCell(row, 0, tview.NewTableCell(e.timeStr()).SetTextColor(tcell.ColorGray))
 			d.evtTbl.SetCell(row, 1, tview.NewTableCell(e.Host).SetTextColor(tcell.ColorAqua))
 			d.evtTbl.SetCell(row, 2, tview.NewTableCell(e.Service).SetTextColor(tcell.ColorWhite))
 			d.evtTbl.SetCell(row, 3, tview.NewTableCell(e.State).SetTextColor(sc))
 			d.evtTbl.SetCell(row, 4, tview.NewTableCell(e.metricStr()).SetTextColor(tcell.ColorYellow))
 			d.evtTbl.SetCell(row, 5, tview.NewTableCell(tags).SetTextColor(tcell.ColorGray))
+			d.evtTbl.SetCell(row, 6, tview.NewTableCell(attrs).SetTextColor(tcell.ColorDarkCyan))
 		}
 	}
 
@@ -707,7 +791,7 @@ func (d *Dashboard) parseMsg(msg []byte) {
 
 func main() {
 	addr := flag.String("addr", "localhost:5556", "Riemann host:port")
-	path := flag.String("path", "/events", "WebSocket endpoint path")
+	path := flag.String("path", "/index", "WebSocket endpoint path")
 	query := flag.String("query", "true", `Riemann stream query, e.g. 'service = "cpu"'`)
 	useTLS := flag.Bool("tls", false, "Use wss:// (TLS)")
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (implies --tls)")
