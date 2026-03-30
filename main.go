@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,31 @@ func (a *AttrMap) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// flexInt64 unmarshals from either a JSON number or a JSON-string containing digits.
+// Riemann's cheshire transport sometimes encodes time_micros as a quoted string.
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return err
+		}
+		*f = flexInt64(n)
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	*f = flexInt64(n)
+	return nil
+}
+
 // RiemannEvent is a Riemann monitoring event decoded from JSON.
 // Riemann WebSocket transport converts protobuf to JSON via cheshire.
 // The metric field may appear as a unified "metric" or as typed variants.
@@ -64,7 +90,7 @@ type RiemannEvent struct {
 	Tags        []string    `json:"tags"`
 	TTL         float64     `json:"ttl"`
 	Time        interface{} `json:"time"` // string ISO-8601 or int64 unix epoch
-	TimeMicros  int64       `json:"time_micros"`
+	TimeMicros  flexInt64   `json:"time_micros"`
 	// Metric variants: Riemann protobuf has metric_sint64, metric_d, metric_f
 	// Some transports unify them under "metric"
 	Metric       interface{} `json:"metric"`
@@ -100,7 +126,7 @@ func (e RiemannEvent) metricStr() string {
 
 func (e RiemannEvent) timeStr() string {
 	if e.TimeMicros != 0 {
-		return time.UnixMicro(e.TimeMicros).Local().Format("15:04:05")
+		return time.UnixMicro(int64(e.TimeMicros)).Local().Format("15:04:05")
 	}
 	switch v := e.Time.(type) {
 	case string:
@@ -116,7 +142,7 @@ func (e RiemannEvent) timeStr() string {
 // eventTime returns the event timestamp, falling back to zero.
 func (e RiemannEvent) eventTime() time.Time {
 	if e.TimeMicros != 0 {
-		return time.UnixMicro(e.TimeMicros)
+		return time.UnixMicro(int64(e.TimeMicros))
 	}
 	switch v := e.Time.(type) {
 	case string:
@@ -765,14 +791,31 @@ func (d *Dashboard) wsConnect() error {
 }
 
 func (d *Dashboard) parseMsg(msg []byte) {
-	// Riemann may send a JSON array of events or a single event object
+	// Riemann cheshire WebSocket transport wraps events in {"ok":true,"events":[...]}
+	var wrapper struct {
+		OK     bool           `json:"ok"`
+		Events []RiemannEvent `json:"events"`
+	}
+	if json.Unmarshal(msg, &wrapper) == nil && len(wrapper.Events) > 0 {
+		for _, e := range wrapper.Events {
+			if e.Host == "" && e.Service == "" {
+				continue
+			}
+			d.addEvent(e)
+		}
+		return
+	}
+
+	// Fallback: bare JSON array of events
 	var batch []RiemannEvent
-	if json.Unmarshal(msg, &batch) == nil {
+	if json.Unmarshal(msg, &batch) == nil && len(batch) > 0 {
 		for _, e := range batch {
 			d.addEvent(e)
 		}
 		return
 	}
+
+	// Fallback: single event object
 	var e RiemannEvent
 	if err := json.Unmarshal(msg, &e); err != nil {
 		if d.debugLog != nil {
