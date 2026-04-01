@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,10 +23,17 @@ import (
 
 const (
 	maxStream    = 500
+	maxHistory   = 500
 	refreshRate  = 200 * time.Millisecond
 	pingInterval = 30 * time.Second
 	pongWait     = 10 * time.Second
 )
+
+// MetricPoint is a single timestamped metric sample stored for graph rendering.
+type MetricPoint struct {
+	t   time.Time
+	val float64
+}
 
 // AttrMap decodes Riemann attributes from either a JSON object
 // {"k":"v"} or the cheshire array format [{"key":"k","value":"v"}].
@@ -122,6 +130,26 @@ func (e RiemannEvent) metricStr() string {
 		return fmt.Sprintf("%d", *e.MetricSint64)
 	}
 	return ""
+}
+
+func (e RiemannEvent) metricFloat() (float64, bool) {
+	var v float64
+	var ok bool
+	if e.Metric != nil {
+		if f, is := e.Metric.(float64); is {
+			v, ok = f, true
+		}
+	} else if e.MetricD != nil {
+		v, ok = *e.MetricD, true
+	} else if e.MetricF != nil {
+		v, ok = float64(*e.MetricF), true
+	} else if e.MetricSint64 != nil {
+		v, ok = float64(*e.MetricSint64), true
+	}
+	if ok && (math.IsNaN(v) || math.IsInf(v, 0)) {
+		return 0, false
+	}
+	return v, ok
 }
 
 func (e RiemannEvent) timeStr() string {
@@ -238,10 +266,18 @@ type Dashboard struct {
 	rateStart time.Time
 	rate      float64
 
+	// history holds timestamped metric samples per "host\x00service" key.
+	history map[string][]MetricPoint
+
 	// filterKey is "host\x00service" of the selected service, empty = show all.
 	// Only accessed from the UI goroutine — no mutex needed.
-	filterKey    string
+	filterKey     string
 	svcRebuilding bool // suppresses filterKey updates during table rebuild
+
+	// graph page state — only accessed from the UI goroutine.
+	graphKey    string
+	graphBox    *tview.Box
+	graphHeader *tview.TextView
 
 	wsScheme string // "ws" or "wss"
 	wsAddr   string
@@ -258,6 +294,7 @@ func newDashboard(scheme, addr, path, query string, insecure bool) *Dashboard {
 		app:       tview.NewApplication(),
 		pages:     tview.NewPages(),
 		summary:   make(map[string]RiemannEvent),
+		history:   make(map[string][]MetricPoint),
 		wsScheme:  scheme,
 		wsAddr:    addr,
 		wsPath:    path,
@@ -352,6 +389,8 @@ func (d *Dashboard) build() {
 	d.pages.AddPage("main", mainPage, true, true)
 	d.pages.AddPage("detail", detailPage, true, false)
 
+	d.buildGraphPage()
+
 	d.app.SetRoot(d.pages, true).EnableMouse(true)
 	d.app.SetInputCapture(d.handleKey)
 }
@@ -379,9 +418,10 @@ func (d *Dashboard) setEvtHeaders() {
 func (d *Dashboard) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 	front, _ := d.pages.GetFrontPage()
 
-	if front == "detail" {
+	if front == "detail" || front == "graph" {
 		if ev.Key() == tcell.KeyEsc || ev.Rune() == 'q' || ev.Rune() == 'Q' {
 			d.pages.SwitchToPage("main")
+			d.app.SetFocus(d.svcTbl)
 			return nil
 		}
 		return ev
@@ -409,6 +449,11 @@ func (d *Dashboard) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 	case ev.Key() == tcell.KeyEnter:
 		if d.app.GetFocus() == d.svcTbl {
 			d.showServiceDetail()
+		}
+		return nil
+	case ev.Rune() == 'g' || ev.Rune() == 'G':
+		if d.app.GetFocus() == d.svcTbl {
+			d.openGraph()
 		}
 		return nil
 	}
@@ -476,6 +521,230 @@ func (d *Dashboard) showServiceDetail() {
 	d.pages.SwitchToPage("detail")
 }
 
+func (d *Dashboard) buildGraphPage() {
+	d.graphHeader = tview.NewTextView().SetDynamicColors(true)
+	d.graphHeader.SetBackgroundColor(tcell.ColorDarkBlue)
+
+	d.graphBox = tview.NewBox()
+	d.graphBox.SetDrawFunc(d.drawGraphCanvas)
+
+	hint := tview.NewTextView().SetDynamicColors(true).
+		SetText("  [darkgray]Esc / q: back[-]")
+	hint.SetBackgroundColor(tcell.ColorDarkBlue)
+
+	graphPage := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(d.graphHeader, 1, 0, false).
+		AddItem(d.graphBox, 0, 1, true).
+		AddItem(hint, 1, 0, false)
+
+	d.pages.AddPage("graph", graphPage, true, false)
+}
+
+func (d *Dashboard) openGraph() {
+	row, _ := d.svcTbl.GetSelection()
+	if row <= 0 {
+		return
+	}
+	cell := d.svcTbl.GetCell(row, 0)
+	if cell == nil {
+		return
+	}
+	ref := cell.GetReference()
+	if ref == nil {
+		return
+	}
+	key, ok := ref.(string)
+	if !ok {
+		return
+	}
+	d.graphKey = key
+	d.updateGraphHeader()
+	d.pages.SwitchToPage("graph")
+	d.app.SetFocus(d.graphBox)
+}
+
+func (d *Dashboard) updateGraphHeader() {
+	if d.graphKey == "" {
+		return
+	}
+	parts := strings.SplitN(d.graphKey, "\x00", 2)
+	host, svc := "", ""
+	if len(parts) == 2 {
+		host, svc = parts[0], parts[1]
+	}
+
+	d.mu.Lock()
+	pts := d.history[d.graphKey]
+	var cur, vMin, vMax float64
+	n := len(pts)
+	if n > 0 {
+		cur = pts[n-1].val
+		vMin, vMax = pts[0].val, pts[0].val
+		for _, p := range pts[1:] {
+			if p.val < vMin {
+				vMin = p.val
+			}
+			if p.val > vMax {
+				vMax = p.val
+			}
+		}
+	}
+	d.mu.Unlock()
+
+	fmtVal := func(v float64) string {
+		if v == float64(int64(v)) && math.Abs(v) < 1e15 {
+			return fmt.Sprintf("%d", int64(v))
+		}
+		return fmt.Sprintf("%.4g", v)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "  [::b]%s[white] :: [::b]%s[-]", host, svc)
+	if n > 0 {
+		fmt.Fprintf(&sb, "   Current: [yellow]%s[-]   Min: [darkgray]%s[-]   Max: [darkgray]%s[-]   [darkgray](%d pts)[-]",
+			fmtVal(cur), fmtVal(vMin), fmtVal(vMax), n)
+	} else {
+		fmt.Fprintf(&sb, "   [darkgray]no metric data yet[-]")
+	}
+	d.graphHeader.SetText(sb.String())
+}
+
+// drawGraphCanvas is the SetDrawFunc callback for graphBox. It renders a
+// real-time braille line graph of the selected service's metric history.
+func (d *Dashboard) drawGraphCanvas(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
+	d.mu.Lock()
+	pts := append([]MetricPoint(nil), d.history[d.graphKey]...)
+	d.mu.Unlock()
+
+	// Clear the area.
+	bgStyle := tcell.StyleDefault
+	for row := y; row < y+height; row++ {
+		for col := x; col < x+width; col++ {
+			screen.SetContent(col, row, ' ', nil, bgStyle)
+		}
+	}
+
+	if len(pts) < 2 {
+		msg := "Waiting for metric data..."
+		midX := x + (width-len(msg))/2
+		midY := y + height/2
+		grayStyle := bgStyle.Foreground(tcell.ColorGray)
+		for i, ch := range msg {
+			screen.SetContent(midX+i, midY, ch, nil, grayStyle)
+		}
+		return x, y, width, height
+	}
+
+	// Time range.
+	tMin := pts[0].t
+	tMax := pts[len(pts)-1].t
+	if tMax.Equal(tMin) {
+		tMin = tMax.Add(-time.Second)
+	}
+	tRangeS := tMax.Sub(tMin).Seconds()
+
+	// Value range.
+	vMin, vMax := pts[0].val, pts[0].val
+	for _, p := range pts[1:] {
+		if p.val < vMin {
+			vMin = p.val
+		}
+		if p.val > vMax {
+			vMax = p.val
+		}
+	}
+	if vMin == vMax {
+		vMin--
+		vMax++
+	}
+	vRange := vMax - vMin
+
+	// Braille canvas: each terminal cell holds a 2×4 dot grid.
+	dotW := width * 2
+	dotH := height * 4
+
+	// cells[row][col] accumulates braille dot bits (OR'd into 0x2800 at render).
+	cells := make([][]uint8, height)
+	for i := range cells {
+		cells[i] = make([]uint8, width)
+	}
+
+	// Bit value for each dot position within a braille cell (row 0–3, col 0–1).
+	brailleMap := [4][2]uint8{
+		{0x01, 0x08},
+		{0x02, 0x10},
+		{0x04, 0x20},
+		{0x40, 0x80},
+	}
+
+	setDot := func(dotX, dotY int) {
+		if dotX < 0 || dotX >= dotW || dotY < 0 || dotY >= dotH {
+			return
+		}
+		cells[dotY/4][dotX/2] |= brailleMap[dotY%4][dotX%2]
+	}
+
+	toCanvas := func(p MetricPoint) (int, int) {
+		tx := (p.t.Sub(tMin).Seconds() / tRangeS) * float64(dotW-1)
+		ty := (1.0 - (p.val-vMin)/vRange) * float64(dotH-1)
+		return int(math.Round(tx)), int(math.Round(ty))
+	}
+
+	absInt := func(n int) int {
+		if n < 0 {
+			return -n
+		}
+		return n
+	}
+
+	// Bresenham's line algorithm connecting consecutive data points.
+	drawLine := func(x0, y0, x1, y1 int) {
+		dx := absInt(x1 - x0)
+		dy := -absInt(y1 - y0)
+		sx, sy := 1, 1
+		if x0 > x1 {
+			sx = -1
+		}
+		if y0 > y1 {
+			sy = -1
+		}
+		err := dx + dy
+		for {
+			setDot(x0, y0)
+			if x0 == x1 && y0 == y1 {
+				break
+			}
+			e2 := 2 * err
+			if e2 >= dy {
+				err += dy
+				x0 += sx
+			}
+			if e2 <= dx {
+				err += dx
+				y0 += sy
+			}
+		}
+	}
+
+	for i := 1; i < len(pts); i++ {
+		cx0, cy0 := toCanvas(pts[i-1])
+		cx1, cy1 := toCanvas(pts[i])
+		drawLine(cx0, cy0, cx1, cy1)
+	}
+
+	// Write braille characters to screen.
+	lineStyle := bgStyle.Foreground(tcell.ColorAqua)
+	for row := 0; row < height; row++ {
+		for col := 0; col < width; col++ {
+			if bits := cells[row][col]; bits != 0 {
+				screen.SetContent(x+col, y+row, rune(0x2800)|rune(bits), nil, lineStyle)
+			}
+		}
+	}
+
+	return x, y, width, height
+}
+
 func (d *Dashboard) addEvent(e RiemannEvent) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -486,7 +755,14 @@ func (d *Dashboard) addEvent(e RiemannEvent) {
 	if len(d.stream) > maxStream {
 		d.stream = d.stream[1:]
 	}
-	d.summary[e.Host+"\x00"+e.Service] = e
+	key := e.Host + "\x00" + e.Service
+	d.summary[key] = e
+	if val, ok := e.metricFloat(); ok {
+		d.history[key] = append(d.history[key], MetricPoint{t: time.Now(), val: val})
+		if len(d.history[key]) > maxHistory {
+			d.history[key] = d.history[key][len(d.history[key])-maxHistory:]
+		}
+	}
 }
 
 func (d *Dashboard) setConnStatus(status, errMsg string) {
@@ -676,9 +952,14 @@ func (d *Dashboard) refreshUI() {
 	}
 	d.statusBar.SetText(fmt.Sprintf(
 		"  Events: [white]%d[-]   Rate: [white]%.1f/s[-]   Services: [white]%d[-]%s   "+
-			"[darkgray]Tab: switch panel   Enter: detail   Esc: clear filter   q: quit[-]",
+			"[darkgray]Tab: switch panel   Enter: detail   g: graph   Esc: clear filter   q: quit[-]",
 		total, rate, len(summary), lastEvtStr,
 	))
+
+	front, _ := d.pages.GetFrontPage()
+	if front == "graph" {
+		d.updateGraphHeader()
+	}
 }
 
 func (d *Dashboard) run() error {
