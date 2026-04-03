@@ -76,7 +76,7 @@ type RiemannEvent struct {
 	// Metric variants: Riemann protobuf has metric_sint64, metric_d, metric_f.
 	// Some transports unify them under "metric".
 	Metric       interface{} `json:"metric"`
-	MetricSint64 *int64      `json:"metric_sint64"`
+	MetricSint64 *flexInt64  `json:"metric_sint64"`
 	MetricD      *float64    `json:"metric_d"`
 	MetricF      *float32    `json:"metric_f"`
 	Attributes   AttrMap     `json:"attributes"`
@@ -101,7 +101,7 @@ func (e RiemannEvent) MetricStr() string {
 		return fmt.Sprintf("%.4g", *e.MetricF)
 	}
 	if e.MetricSint64 != nil {
-		return fmt.Sprintf("%d", *e.MetricSint64)
+		return fmt.Sprintf("%d", int64(*e.MetricSint64))
 	}
 	return ""
 }
@@ -118,7 +118,7 @@ func (e RiemannEvent) MetricFloat() (float64, bool) {
 	} else if e.MetricF != nil {
 		v, ok = float64(*e.MetricF), true
 	} else if e.MetricSint64 != nil {
-		v, ok = float64(*e.MetricSint64), true
+		v, ok = float64(int64(*e.MetricSint64)), true
 	}
 	if ok && (math.IsNaN(v) || math.IsInf(v, 0)) {
 		return 0, false
