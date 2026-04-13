@@ -48,6 +48,9 @@ type Dashboard struct {
 	// history holds timestamped metric samples per "host\x00service" key.
 	history map[string][]event.MetricPoint
 
+	// svcFilter is the text search bar below the services table.
+	svcFilter *tview.InputField
+
 	// filterKey is "host\x00service" of the selected service, empty = show all.
 	// Only accessed from the UI goroutine — no mutex needed.
 	filterKey     string

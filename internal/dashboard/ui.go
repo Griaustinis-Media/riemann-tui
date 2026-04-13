@@ -71,9 +71,29 @@ func (d *Dashboard) build() {
 	d.statusBar = tview.NewTextView().SetDynamicColors(true)
 	d.statusBar.SetBackgroundColor(tcell.ColorDarkBlue)
 
+	// ── Service search bar ─────────────────────────────────────────────
+	d.svcFilter = tview.NewInputField().
+		SetLabel(" / ").
+		SetLabelColor(tcell.ColorGray).
+		SetFieldBackgroundColor(tcell.ColorBlack).
+		SetPlaceholder("filter...").
+		SetPlaceholderStyle(tcell.StyleDefault.Foreground(tcell.ColorDarkSlateGray))
+	d.svcFilter.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+		switch ev.Key() {
+		case tcell.KeyEsc, tcell.KeyEnter:
+			d.app.SetFocus(d.svcTbl)
+			return nil
+		}
+		return ev
+	})
+
+	svcPanel := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(d.svcTbl, 0, 1, false).
+		AddItem(d.svcFilter, 1, 0, false)
+
 	// ── Main page layout ───────────────────────────────────────────────
 	mainBody := tview.NewFlex().
-		AddItem(d.svcTbl, 32, 0, false).
+		AddItem(svcPanel, 32, 0, false).
 		AddItem(d.evtPages, 0, 1, true)
 
 	mainPage := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -131,8 +151,22 @@ func (d *Dashboard) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 		return ev
 	}
 
+	// When the filter input has focus only intercept navigation keys;
+	// everything else is passed through so the InputField can receive it.
+	if d.app.GetFocus() == d.svcFilter {
+		if ev.Key() == tcell.KeyTab {
+			d.app.SetFocus(d.evtTbl)
+			return nil
+		}
+		return ev
+	}
+
 	switch {
 	case ev.Key() == tcell.KeyEsc:
+		if d.svcFilter.GetText() != "" {
+			d.svcFilter.SetText("")
+			return nil
+		}
 		if d.filterKey != "" {
 			d.filterKey = ""
 			return nil
@@ -143,10 +177,10 @@ func (d *Dashboard) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 		d.app.Stop()
 		return nil
 	case ev.Key() == tcell.KeyTab:
-		if d.app.GetFocus() == d.svcTbl {
-			d.app.SetFocus(d.evtTbl)
-		} else {
+		if d.app.GetFocus() == d.evtTbl {
 			d.app.SetFocus(d.svcTbl)
+		} else {
+			d.app.SetFocus(d.evtTbl)
 		}
 		return nil
 	case ev.Key() == tcell.KeyEnter:
@@ -158,6 +192,9 @@ func (d *Dashboard) handleKey(ev *tcell.EventKey) *tcell.EventKey {
 		if d.app.GetFocus() == d.svcTbl {
 			d.openGraph()
 		}
+		return nil
+	case ev.Rune() == '/':
+		d.app.SetFocus(d.svcFilter)
 		return nil
 	}
 	return ev
@@ -222,6 +259,52 @@ func (d *Dashboard) showServiceDetail() {
 	d.detail.ScrollToBeginning()
 	d.detail.SetTitle(fmt.Sprintf(" [ %s :: %s ] ", e.Host, e.Service))
 	d.pages.SwitchToPage("detail")
+}
+
+// globMatchRunes reports whether pattern p matches string s.
+// Only '*' is special: it matches any sequence of runes.
+func globMatchRunes(p, s []rune) bool {
+	for len(p) > 0 {
+		if p[0] == '*' {
+			for len(p) > 0 && p[0] == '*' {
+				p = p[1:]
+			}
+			if len(p) == 0 {
+				return true
+			}
+			for i := 0; i <= len(s); i++ {
+				if globMatchRunes(p, s[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(s) == 0 || p[0] != s[0] {
+			return false
+		}
+		p = p[1:]
+		s = s[1:]
+	}
+	return len(s) == 0
+}
+
+// matchesFilter reports whether a service/host pair satisfies filter.
+// Rules:
+//   - Empty filter → always matches.
+//   - No '*' → case-insensitive substring match against service or host.
+//   - Contains '*' → case-insensitive glob match against service or host.
+func matchesFilter(filter, service, host string) bool {
+	if filter == "" {
+		return true
+	}
+	if !strings.Contains(filter, "*") {
+		f := strings.ToLower(filter)
+		return strings.Contains(strings.ToLower(service), f) ||
+			strings.Contains(strings.ToLower(host), f)
+	}
+	fp := []rune(strings.ToLower(filter))
+	return globMatchRunes(fp, []rune(strings.ToLower(service))) ||
+		globMatchRunes(fp, []rune(strings.ToLower(host)))
 }
 
 // emptyStateText returns a descriptive message for the empty events panel.
@@ -309,12 +392,23 @@ func (d *Dashboard) refreshUI() {
 	}
 	sort.Strings(keys)
 
+	svcSearch := d.svcFilter.GetText()
+	if svcSearch != "" {
+		d.svcTbl.SetTitle(fmt.Sprintf("[::b] Services [yellow]%s[-] ", svcSearch))
+	} else {
+		d.svcTbl.SetTitle("[::b] Services ")
+	}
+
 	selRow, _ := d.svcTbl.GetSelection()
 	d.svcRebuilding = true
 	d.svcTbl.Clear()
 	d.setSvcHeaders()
-	for row, k := range keys {
+	row := 0
+	for _, k := range keys {
 		e := summary[k]
+		if !matchesFilter(svcSearch, e.Service, e.Host) {
+			continue
+		}
 		sc := stateColor(e.State)
 		svc := e.Service
 		if len(svc) > 18 {
@@ -332,8 +426,9 @@ func (d *Dashboard) refreshUI() {
 		d.svcTbl.SetCell(row+1, 1, tview.NewTableCell(svc).SetTextColor(tcell.ColorWhite))
 		d.svcTbl.SetCell(row+1, 2, tview.NewTableCell(host).SetTextColor(tcell.ColorGray))
 		d.svcTbl.SetCell(row+1, 3, tview.NewTableCell(e.MetricStr()).SetTextColor(tcell.ColorYellow))
+		row++
 	}
-	if selRow > 0 && selRow <= len(keys) {
+	if selRow > 0 && selRow <= row {
 		d.svcTbl.Select(selRow, 0)
 	}
 	d.svcRebuilding = false
@@ -398,7 +493,7 @@ func (d *Dashboard) refreshUI() {
 	}
 	d.statusBar.SetText(fmt.Sprintf(
 		"  Events: [white]%d[-]   Rate: [white]%.1f/s[-]   Services: [white]%d[-]%s   "+
-			"[darkgray]Tab: switch panel   Enter: detail   g: graph   Esc: clear filter   q: quit[-]",
+			"[darkgray]Tab: switch panel   Enter: detail   g: graph   /: search   Esc: clear   q: quit[-]",
 		total, rate, len(summary), lastEvtStr,
 	))
 
